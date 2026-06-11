@@ -2,7 +2,8 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 
 const BASE = import.meta.env.VITE_API_BASE_URL || '';
 const STORAGE_KEY = 'streamchat_v1';
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 2;
+const READ_TIMEOUT_MS = 10_000; // treat silence > 10s as a network failure
 
 function loadMessages() {
   try {
@@ -13,6 +14,17 @@ function loadMessages() {
   }
 }
 
+// Race a reader.read() against a timeout so a dead server doesn't hang forever
+function readWithTimeout(reader, ms) {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error('Connection timed out')), ms);
+    reader.read().then(
+      result => { clearTimeout(id); resolve(result); },
+      err    => { clearTimeout(id); reject(err); }
+    );
+  });
+}
+
 export function useChat() {
   const [messages, setMessages] = useState(loadMessages);
   const [streaming, setStreaming] = useState(false);
@@ -20,21 +32,19 @@ export function useChat() {
 
   const messagesRef = useRef(messages);
   const streamIdRef = useRef(null);
-  const abortRef = useRef(null);
+  const abortRef   = useRef(null);
 
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
 
   // Persist only completed messages
   useEffect(() => {
-    const completed = messages.filter(
+    const done = messages.filter(
       m => m.status !== 'streaming' && m.status !== 'reconnecting'
     );
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(completed)); } catch {}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(done)); } catch {}
   }, [messages]);
 
-  // Core single-attempt stream. progress.content tracks chars emitted this attempt.
+  // Single stream attempt. Mutates `progress` so the retry loop can pick up where it left off.
   const streamOnce = useCallback(async ({
     history, assistantId, replyIndex, resumeFrom, streamId, signal, progress,
   }) => {
@@ -51,7 +61,7 @@ export function useChat() {
     let buf = '';
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithTimeout(reader, READ_TIMEOUT_MS);
       if (done) break;
 
       buf += decoder.decode(value, { stream: true });
@@ -92,9 +102,14 @@ export function useChat() {
     }
   }, []);
 
-  // Retry loop — handles reconnect transparently
-  const streamWithRetry = useCallback(async ({ history, assistantId }) => {
-    const progress = { content: '', replyIndex: null };
+  // Retry loop — reconnects transparently, falls through to error state after MAX_RETRIES.
+  // initialReplyIndex / initialResumeFrom let retryLast() resume a previously failed message.
+  const streamWithRetry = useCallback(async ({
+    history, assistantId, initialReplyIndex = null, initialResumeFrom = 0,
+  }) => {
+    const progress = { content: '', replyIndex: initialReplyIndex };
+    // Seed content length so resumeFrom is correct on first attempt of a retry
+    const contentOffset = initialResumeFrom;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       const streamId = crypto.randomUUID();
@@ -104,13 +119,13 @@ export function useChat() {
         await streamOnce({
           history,
           assistantId,
-          replyIndex: progress.replyIndex,
-          resumeFrom: progress.content.length,
+          replyIndex:  progress.replyIndex,
+          resumeFrom:  contentOffset + progress.content.length,
           streamId,
-          signal: abortRef.current.signal,
+          signal:      abortRef.current.signal,
           progress,
         });
-        return; // success
+        return; // success — exit retry loop
       } catch (err) {
         if (err.name === 'AbortError' || abortRef.current?.signal.aborted) {
           setMessages(prev => prev.map(m =>
@@ -120,14 +135,22 @@ export function useChat() {
         }
 
         if (attempt === MAX_RETRIES) {
+          // Store replyIndex + how much was delivered so retryLast() can resume
           setError(err.message);
           setMessages(prev => prev.map(m =>
-            m.id === assistantId ? { ...m, status: 'error' } : m
+            m.id === assistantId
+              ? {
+                  ...m,
+                  status: 'error',
+                  _replyIndex:  progress.replyIndex,
+                  _resumeFrom:  contentOffset + progress.content.length,
+                }
+              : m
           ));
           return;
         }
 
-        // Network failure — show reconnecting state and retry
+        // Transient failure — show reconnecting and back off
         setMessages(prev => prev.map(m =>
           m.id === assistantId ? { ...m, status: 'reconnecting' } : m
         ));
@@ -143,10 +166,9 @@ export function useChat() {
     setStreaming(true);
     abortRef.current = new AbortController();
 
-    const userMsg = { id: crypto.randomUUID(), role: 'user', content: text, status: 'done' };
+    const userMsg    = { id: crypto.randomUUID(), role: 'user', content: text, status: 'done' };
     const assistantId = crypto.randomUUID();
 
-    // Snapshot history before state update (ref still has old messages)
     const history = [...messagesRef.current, userMsg].map(({ role, content }) => ({ role, content }));
 
     setMessages(prev => [
@@ -174,6 +196,43 @@ export function useChat() {
     } catch {}
   }, []);
 
+  // Resume the last errored message from where it stopped (keeps partial content)
+  const retryLast = useCallback(async () => {
+    const msgs = messagesRef.current;
+    if (streaming || msgs.length === 0) return;
+
+    let lastAssistantIdx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'assistant') { lastAssistantIdx = i; break; }
+    }
+    const lastAssistant = msgs[lastAssistantIdx];
+    if (!lastAssistant || lastAssistant.status !== 'error') return;
+
+    const history = msgs
+      .slice(0, lastAssistantIdx)
+      .map(({ role, content }) => ({ role, content }));
+
+    setError(null);
+    setStreaming(true);
+    abortRef.current = new AbortController();
+
+    // Keep partial content visible, just flip status back to streaming
+    setMessages(prev => prev.map(m =>
+      m.id === lastAssistant.id ? { ...m, status: 'streaming' } : m
+    ));
+
+    await streamWithRetry({
+      history,
+      assistantId:        lastAssistant.id,
+      initialReplyIndex:  lastAssistant._replyIndex  ?? null,
+      initialResumeFrom:  lastAssistant._resumeFrom  ?? lastAssistant.content.length,
+    });
+
+    setStreaming(false);
+    abortRef.current = null;
+  }, [streaming, streamWithRetry]);
+
+  // Re-run the last assistant reply from scratch (clears content)
   const regenerate = useCallback(async () => {
     const msgs = messagesRef.current;
     if (streaming || msgs.length === 0) return;
@@ -185,7 +244,6 @@ export function useChat() {
     if (lastAssistantIdx === -1) return;
 
     const assistantId = msgs[lastAssistantIdx].id;
-    // History = everything before the last assistant message (up to last user message)
     const history = msgs
       .slice(0, lastAssistantIdx)
       .map(({ role, content }) => ({ role, content }));
@@ -194,7 +252,6 @@ export function useChat() {
     setStreaming(true);
     abortRef.current = new AbortController();
 
-    // Reset the assistant bubble to empty+streaming
     setMessages(prev => prev.map(m =>
       m.id === assistantId ? { ...m, content: '', status: 'streaming' } : m
     ));
@@ -211,5 +268,5 @@ export function useChat() {
     try { localStorage.removeItem(STORAGE_KEY); } catch {}
   }, []);
 
-  return { messages, streaming, error, send, stop, regenerate, clearHistory };
+  return { messages, streaming, error, send, stop, regenerate, retryLast, clearHistory };
 }

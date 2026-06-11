@@ -11,17 +11,15 @@ const SUGGESTIONS = [
 ];
 
 export default function App() {
-  const { messages, streaming, error, send, stop, regenerate, clearHistory } = useChat();
+  const { messages, streaming, error, send, stop, regenerate, retryLast, clearHistory } = useChat();
   const bottomRef = useRef(null);
 
   const showSuggestions = messages.length === 0 && !streaming;
 
-  // Last message is an assistant message that's done/cancelled → show Regenerate
   const lastMsg = messages[messages.length - 1];
-  const showRegenerate =
-    !streaming &&
-    lastMsg?.role === 'assistant' &&
-    (lastMsg.status === 'done' || lastMsg.status === 'cancelled' || lastMsg.status === 'error');
+  const showRetry      = !streaming && lastMsg?.role === 'assistant' && lastMsg.status === 'error';
+  const showRegenerate = !streaming && lastMsg?.role === 'assistant' &&
+    (lastMsg.status === 'done' || lastMsg.status === 'cancelled') && !showRetry;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -58,6 +56,14 @@ export default function App() {
         {messages.map(msg => (
           <Message key={msg.id} message={msg} />
         ))}
+
+        {showRetry && (
+          <div className="regenerate-row">
+            <button className="regenerate-btn regenerate-btn--retry" onClick={retryLast} aria-label="Retry">
+              ↺ Retry
+            </button>
+          </div>
+        )}
 
         {showRegenerate && (
           <div className="regenerate-row">

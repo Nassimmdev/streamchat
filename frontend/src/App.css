@@ -419,6 +419,17 @@ body {
   background: var(--purple-light);
 }
 
+.regenerate-btn--retry {
+  border-color: rgba(239, 68, 68, 0.4);
+  color: var(--stop);
+}
+
+.regenerate-btn--retry:hover {
+  border-color: var(--stop);
+  color: var(--stop);
+  background: rgba(239, 68, 68, 0.07);
+}
+
 /* ── Scrollbar ── */
 .chat-window::-webkit-scrollbar { width: 4px; }
 .chat-window::-webkit-scrollbar-track { background: transparent; }
