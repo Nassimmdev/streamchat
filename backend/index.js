@@ -23,7 +23,16 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const app = express();
 const streams = new Map();
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173' }));
+app.use(cors({
+  origin: (origin, callback) => {
+    const allowed = (process.env.CORS_ORIGIN || 'http://localhost:5173').split(',').map(s => s.trim());
+    if (!origin || allowed.includes(origin) || origin.endsWith('.vercel.app')) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS: origin not allowed'));
+    }
+  },
+}));
 app.use(express.json());
 
 app.get('/api/health', (_, res) => res.json({ ok: true }));
